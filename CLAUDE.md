@@ -20,6 +20,24 @@ GUI / cable_torque_ctrl_node  <--ROS2-->  ak_motor_cable_control_node (this pack
 Design requirement source: `fsc_PegasusSimulator/docs/design_requirements/design_requirements.txt`
 (req. #4-6) and that repo's own `CLAUDE.md` ("Part 2" of the variable-length-cable work).
 
+## Verification status
+
+- **SPEED mode: confirmed working** (user-tested, live, with the drone actually hovering).
+  Took three iterations to get right — see the SPEED mode section under Key design decisions
+  for the full debugging story (units mismatch → too-stiff PD → gravity feedforward + soft
+  gains) and the Watchdogs section for a follow-up fix (Stop was dropping the payload after
+  ~500ms; fixed by removing the weak watchdog fallback in favor of always holding position).
+- **EXTERNAL mode: implemented, NOT yet runtime-verified.** Next things to check when resuming:
+  state transitions (`off→standby→running` via `~/enable_external_mode` + `~/ext_torque_enable`),
+  the `ext_torque_cmd` sign convention (should already be correct — see the sign-convention
+  table below — but hasn't been confirmed against a real hovering test), the authority
+  hierarchy (ground station's `~/ext_mode_cmd="off"` should always revoke access even from an
+  active external controller), and the `RUNNING→STANDBY` fallback (should hold position
+  cleanly via the same fix as SPEED's stale-command case, but not yet directly observed).
+  Also unvalidated: requirement #5 (`ros2 launch ak_motor_driver cable_torque_ctrl.launch.py`,
+  unmodified, driving the sim cable in external mode) and #6 (GUI's Stop/Emergency-Stop/Exit-
+  External buttons correctly override the emulator).
+
 ## Build
 
 ```bash
@@ -181,9 +199,13 @@ commands `0.0` N (freewheel), standing in for the real driver's `exit_mit_mode` 
 Ported exactly from the real driver, including the authority split (ground station owns the
 outer gate via `~/enable_external_mode` service + `~/ext_mode_cmd`; an external controller node
 owns only the inner gate via `~/ext_torque_enable`) and the `RUNNING → STANDBY` /
-heartbeat-lost fallback to zero-velocity SPEED mode. See the real driver's own `CLAUDE.md`
-(`AK40-10-ROS2-Bridge/CLAUDE.md`, § External mode) for the full state diagram and activation
-sequence — it applies here unchanged.
+heartbeat-lost fallback, which sets `control_mode_=SPEED` with `current_cmd_velocity_=0`. On
+this emulator that now means **hold position** (not just "zero velocity") — it lands in the
+SPEED-mode PD+feedforward path with a zero target velocity, which per the Watchdogs section
+below actively holds rather than passively damping. This has not been directly observed yet
+(see Verification status) — worth confirming the transition is smooth (no snap) when this is
+tested. See the real driver's own `CLAUDE.md` (`AK40-10-ROS2-Bridge/CLAUDE.md`, § External
+mode) for the full state diagram and activation sequence — it applies here unchanged.
 
 ### Watchdogs
 
