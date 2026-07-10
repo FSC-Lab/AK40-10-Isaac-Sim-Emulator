@@ -11,7 +11,26 @@
 //
 // Only SPEED mode and EXTERNAL mode are actuated (drive real forces into the sim).
 // POSITION/TORQUE mode_cmd switches are accepted so the GUI never errors, but commands
-// received in those modes are not applied to the cable (damping-to-zero fallback instead).
+// received in those modes are not applied to the cable — the poll loop just holds the cable
+// at its current position instead (see compute_and_publish_force()).
+//
+// DELIBERATE DIVERGENCE FROM THE REAL DRIVER (temporary): on real hardware, SPEED mode's
+// ~/command.velocity[0] is raw motor-shaft rad/s and the control law is a pure damper
+// (force = kd_speed*(v_des-v_actual), no position term, and no gravity feedforward) — see
+// AK40-10-ROS2-Bridge's ak_motor_cable_control_node.cpp. That's fine on real hardware, where
+// the winch's own mechanical friction/self-locking keeps a stale/disabled command from letting
+// the load free-fall. This sim's cable is frictionless: a pure damper (or its watchdog
+// fallback) would let the ~3.14 N gravity load on the default payload free-fall to the ground
+// whenever there's no fresh command driving it (confirmed empirically — e.g. the GUI's Stop
+// button publishes one command then stops, so anything relying on continuous commands to hold
+// position drops the payload ~500ms later). So here, ~/command.velocity[0] is instead
+// interpreted directly in m/s (retract-positive, no radius scaling), and SPEED mode runs PD +
+// an explicit gravity_feedforward_n term against a position setpoint integrated from that
+// velocity command. Whenever there's no fresh SPEED command to track, the same PD+feedforward
+// law holds the setpoint at the current actual position instead of falling back to a weak
+// damper — see compute_and_publish_force() for the full derivation. The real
+// AK40-10-ROS2-Bridge driver is planned to be updated to this same convention later; until
+// then, this emulator's SPEED mode does NOT behave identically to the real driver's.
 
 #include <algorithm>
 #include <rclcpp/rclcpp.hpp>
@@ -39,9 +58,20 @@ class AkMotorCableControlNode : public rclcpp::Node {
     declare_parameter("isaac_winch_prefix", "cable_winch_0/");
     declare_parameter("poll_rate_hz", 100.0);
     declare_parameter("effective_radius", 0.036);
-    declare_parameter("kd_speed", 0.5);
+    // SPEED-mode PD + feedforward, m/s command convention (see file header) — NOT the same
+    // units as the real driver's kd_speed (N.m.s/rad). gravity_feedforward_n cancels the
+    // constant gravity load directly (mirrors cable_torque_ctrl_node's own tau_p=-m*g*r
+    // feedforward), so kp_speed/kd_speed only have to provide gentle tracking dynamics, not
+    // disturbance rejection — keeping them soft enough to stay stable through the ROS2 +
+    // Isaac Sim (GUI-rendering, sub-100Hz) control loop. An earlier attempt at kp_speed=2000
+    // (implying a ~79 rad/s natural frequency) made kp alone fight gravity and was stiff
+    // enough to destabilize the physics solver. Defaults below target ~5.6 rad/s, near-critical
+    // damping, for this scenario's default ~0.32 kg cable+payload mass — retune (along with
+    // gravity_feedforward_n) if scenario masses change.
+    declare_parameter("gravity_feedforward_n", 3.14);  // N — (rod_b_mass+payload_mass)*g
+    declare_parameter("kp_speed", 10.0);   // N/m
+    declare_parameter("kd_speed", 4.0);    // N.s/m
     declare_parameter("command_timeout_ms", 500.0);
-    declare_parameter("kd_watchdog", 0.05);
     declare_parameter("heartbeat_timeout_ms", 1500.0);
     declare_parameter("torque_limit_upper",  1.5);   // N.m
     declare_parameter("torque_limit_lower", -1.5);   // N.m
@@ -50,11 +80,13 @@ class AkMotorCableControlNode : public rclcpp::Node {
     const double rate_hz  = get_parameter("poll_rate_hz").as_double();
     effective_radius_     = get_parameter("effective_radius").as_double();
     command_timeout_ms_   = get_parameter("command_timeout_ms").as_double();
-    kd_watchdog_          = get_parameter("kd_watchdog").as_double();
     heartbeat_timeout_ms_ = get_parameter("heartbeat_timeout_ms").as_double();
+    gravity_feedforward_n_ = get_parameter("gravity_feedforward_n").as_double();
+    kp_speed_             = get_parameter("kp_speed").as_double();
     kd_speed_             = get_parameter("kd_speed").as_double();
     torque_limit_upper_   = get_parameter("torque_limit_upper").as_double();
     torque_limit_lower_   = get_parameter("torque_limit_lower").as_double();
+    poll_period_s_        = 1.0 / rate_hz;
 
     // --- Publishers (driver-facing interface, matches ak_motor_cable_control_node exactly) ---
     joint_state_pub_    = create_publisher<sensor_msgs::msg::JointState>("~/joint_state", 10);
@@ -127,6 +159,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
             ext_mode_state_        = ExternalModeState::STANDBY;
             control_mode_          = ControlMode::SPEED;
             current_cmd_velocity_  = 0.0;
+            p_des_retract_         = p_actual_retract();
             has_command_           = true;
             last_cmd_time_         = now();
             RCLCPP_INFO(get_logger(), "External mode: RUNNING -> STANDBY, holding zero velocity");
@@ -160,6 +193,9 @@ class AkMotorCableControlNode : public rclcpp::Node {
         [this](const std_srvs::srv::Trigger::Request::SharedPtr,
                std_srvs::srv::Trigger::Response::SharedPtr resp) {
           enabled_ = true;
+          // Re-sync the SPEED setpoint so enabling never produces a snap force from wherever
+          // the cable drifted to while disabled.
+          p_des_retract_ = p_actual_retract();
           resp->success = true;
           resp->message = "Motor enabled";
           RCLCPP_INFO(get_logger(), "Motor enabled");
@@ -218,9 +254,11 @@ class AkMotorCableControlNode : public rclcpp::Node {
     poll_timer_ = create_wall_timer(period, [this]() { poll_tick(); });
 
     RCLCPP_INFO(get_logger(),
-                "Cable control emulator ready (Isaac Sim prefix '%s', effective_radius=%.4f m), "
+                "Cable control emulator ready (Isaac Sim prefix '%s', effective_radius=%.4f m, "
+                "gravity_feedforward_n=%.2f N, kp_speed=%.1f N/m, kd_speed=%.1f N.s/m), "
                 "default mode: SPEED",
-                isaac_prefix.c_str(), effective_radius_);
+                isaac_prefix.c_str(), effective_radius_, gravity_feedforward_n_, kp_speed_,
+                kd_speed_);
   }
 
  private:
@@ -239,7 +277,8 @@ class AkMotorCableControlNode : public rclcpp::Node {
               "Mode mismatch: SPEED mode only uses velocity field "
               "(got position=%.3f effort=%.3f — ignoring)", pos, eff);
         }
-        // rad/s, positive = retract (matches real hardware's raw-shaft ~/command convention).
+        // m/s, positive = retract (emulator-specific convention — see file header; NOT the
+        // real hardware's raw-shaft rad/s convention).
         current_cmd_velocity_ = vel;
         break;
 
@@ -271,8 +310,13 @@ class AkMotorCableControlNode : public rclcpp::Node {
     const std::string& m = msg->data;
     if (m == "speed") {
       control_mode_ = ControlMode::SPEED;
+      gravity_feedforward_n_ = get_parameter("gravity_feedforward_n").as_double();
+      kp_speed_ = get_parameter("kp_speed").as_double();
       kd_speed_ = get_parameter("kd_speed").as_double();
-      RCLCPP_INFO(get_logger(), "Control mode -> SPEED (kd=%.3f)", kd_speed_);
+      // Re-sync the integrated position setpoint to the current actual position so switching
+      // into SPEED mode never produces a snap force from stale/zero setpoint history.
+      p_des_retract_ = p_actual_retract();
+      RCLCPP_INFO(get_logger(), "Control mode -> SPEED (kp=%.3f kd=%.3f)", kp_speed_, kd_speed_);
     } else if (m == "torque") {
       control_mode_ = ControlMode::TORQUE;
       RCLCPP_INFO(get_logger(), "Control mode -> TORQUE (not actuated by this emulator)");
@@ -333,6 +377,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
           ext_torque_cmd_        = 0.0;
           control_mode_          = ControlMode::SPEED;
           current_cmd_velocity_  = 0.0;
+          p_des_retract_         = p_actual_retract();
           has_command_           = true;
           last_cmd_time_         = now();
           RCLCPP_WARN(get_logger(),
@@ -355,6 +400,13 @@ class AkMotorCableControlNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "External mode disabled, control mode restored");
   }
 
+  // Current cable position in the same retract-positive frame as v_actual_retract, zeroed by
+  // extension_offset_ (zero_position / enable_external_mode). Extend-positive sim `extension`
+  // flips sign here, same as the joint_state synthesis in on_state_cable().
+  double p_actual_retract() const {
+    return -(last_extension_ - extension_offset_);
+  }
+
   const char* ext_mode_state_str() const {
     switch (ext_mode_state_) {
       case ExternalModeState::OFF:     return "off";
@@ -368,29 +420,50 @@ class AkMotorCableControlNode : public rclcpp::Node {
   // retract-positive throughout (the sim's command/force and the real hardware's
   // ext_torque_cmd already share that sign; only the SPEED-mode velocity comparison needs
   // an explicit flip because the sim's extension_vel is extend-positive).
+  //
+  // SPEED mode runs PD + gravity feedforward against a position setpoint that is integrated
+  // from the commanded velocity each tick (p_des_retract_ += v_des_retract * dt) whenever
+  // there's a fresh SPEED command to actively track. Whenever there ISN'T — command gone
+  // stale (e.g. the GUI's Stop button publishes one zero-velocity message and then stops
+  // republishing, so the "fresh" window is only command_timeout_ms long), no command received
+  // yet, or POSITION/TORQUE mode (not actuated) — the setpoint freezes at the current actual
+  // position and the SAME PD+feedforward law holds it there. Unlike the real driver's
+  // kd_watchdog fallback (a weak pure damper, safe on real hardware because the winch's own
+  // mechanical friction/self-locking keeps it from free-falling), this sim's cable is
+  // frictionless: without feedforward, the fallback branch would let the payload's ~3.14 N
+  // weight free-fall to the ground. So there is deliberately no separate weak "watchdog" law
+  // here — going stale means "hold position," not "go passive."
   void compute_and_publish_force() {
     const double v_actual_retract = -last_extension_vel_;
+    const double p_actual = p_actual_retract();
     double force_retract = 0.0;
 
     if (!enabled_) {
       force_retract = 0.0;  // freewheel — stands in for the real exit_mit_mode CAN frame
+      p_des_retract_ = p_actual;
     } else if (ext_mode_state_ == ExternalModeState::RUNNING) {
       force_retract = ext_torque_cmd_ / effective_radius_;
+      p_des_retract_ = p_actual;
     } else {
       const double elapsed_ms = (now() - last_cmd_time_).nanoseconds() / 1e6;
       const bool command_fresh = has_command_ && elapsed_ms <= command_timeout_ms_;
-      if (command_fresh && control_mode_ == ControlMode::SPEED) {
-        const double v_des_retract = current_cmd_velocity_ * effective_radius_;
-        force_retract = kd_speed_ * (v_des_retract - v_actual_retract);
+      const bool actively_tracking = command_fresh && control_mode_ == ControlMode::SPEED;
+
+      double v_des_retract = 0.0;
+      if (actively_tracking) {
+        v_des_retract = current_cmd_velocity_;  // m/s, already retract-positive
+        p_des_retract_ += v_des_retract * poll_period_s_;
       } else {
-        // Command stale/missing, or POSITION/TORQUE mode (not actuated this pass) — damp to
-        // zero velocity, matching the real driver's kd_watchdog fallback.
-        force_retract = kd_watchdog_ * (0.0 - v_actual_retract);
-        if (has_command_ && control_mode_ == ControlMode::SPEED) {
+        p_des_retract_ = p_actual;  // hold wherever we are — see function comment
+        if (has_command_ && control_mode_ == ControlMode::SPEED && !command_fresh) {
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                               "Command timeout (%.0f ms), watchdog active", elapsed_ms);
+                               "Command timeout (%.0f ms), holding position", elapsed_ms);
         }
       }
+
+      const double e_p = p_des_retract_ - p_actual;
+      const double e_v = v_des_retract - v_actual_retract;
+      force_retract = gravity_feedforward_n_ + kp_speed_ * e_p + kd_speed_ * e_v;
     }
 
     last_force_retract_ = force_retract;
@@ -474,7 +547,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
 
   ControlMode  control_mode_{ControlMode::SPEED};
   ControlMode  prev_control_mode_{ControlMode::SPEED};
-  double       current_cmd_velocity_{0.0};  // rad/s, positive = retract
+  double       current_cmd_velocity_{0.0};  // m/s, positive = retract
   rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_heartbeat_time_{0, 0, RCL_ROS_TIME};
   rclcpp::Time last_heartbeat_ext_time_{0, 0, RCL_ROS_TIME};
@@ -484,9 +557,12 @@ class AkMotorCableControlNode : public rclcpp::Node {
   bool         enabled_{false};
   bool         heartbeat_lost_{false};
   double       command_timeout_ms_{500.0};
-  double       kd_watchdog_{0.05};
   double       heartbeat_timeout_ms_{1500.0};
-  double       kd_speed_{0.5};
+  double       gravity_feedforward_n_{3.14};  // N — cancels constant gravity load in SPEED mode
+  double       kp_speed_{10.0};              // N/m — SPEED-mode PD position gain
+  double       kd_speed_{4.0};               // N.s/m — SPEED-mode PD velocity gain
+  double       p_des_retract_{0.0};         // m — SPEED-mode integrated position setpoint
+  double       poll_period_s_{0.01};        // s — fixed dt for the setpoint integrator
 
   // External mode
   ExternalModeState ext_mode_state_{ExternalModeState::OFF};
