@@ -1,0 +1,24 @@
+ak_motor_cable_control_node:
+  ros__parameters:
+    # Isaac Sim side (ROS2CableWinchBackend topic prefix, cable_winch_backend_utils.py)
+    isaac_winch_prefix: "cable_winch_0/"
+
+    poll_rate_hz: 100.0
+
+    # Torque(N.m)/force(N) and rad-s/m-s scale factor. Defaults to the real
+    # AK40-10 winch's deployed drum_radius (config/cable_control_params.yaml
+    # in AK40-10-ROS2-Bridge) so kd_speed and torque_limit_* keep the same
+    # calibrated real-world meaning.
+    effective_radius: 0.036   # m
+
+    # Speed mode gain (kp is always 0 in speed mode) - N.m.s/rad
+    kd_speed: 0.5
+
+    # Safety
+    command_timeout_ms: 500.0
+    kd_watchdog: 0.05
+    heartbeat_timeout_ms: 1500.0
+
+    # External mode torque clamp
+    torque_limit_upper:  1.5    # N.m
+    torque_limit_lower: -1.5    # N.m

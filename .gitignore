@@ -1,0 +1,15 @@
+# colcon / ament_cmake build artifacts
+build/
+install/
+log/
+
+# Editor / IDE
+.vscode/
+*.swp
+
+# OS cruft
+.DS_Store
+
+# Compiled objects
+*.o
+*.so

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ak_motor_cable_control_emulator</name>
+  <version>0.1.0</version>
+  <description>Isaac Sim-backed drop-in emulator for ak_motor_driver's ak_motor_cable_control_node, so the ground station GUI and cable_torque_ctrl_node run unmodified against the simulated variable-length slung-load cable.</description>
+  <maintainer email="longhao.qian@gmail.com">longhao</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
