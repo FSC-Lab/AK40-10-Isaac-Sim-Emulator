@@ -17,10 +17,11 @@ ak_motor_cable_control_node:
     # cable_torque_ctrl_node's own tau_p=-m*g*r feedforward), so kp_speed/kd_speed only need to
     # provide gentle tracking dynamics, not disturbance rejection. An earlier attempt relying on
     # kp_speed alone to fight gravity (kp_speed=2000) was stiff enough to destabilize the physics
-    # solver through the ROS2 + Isaac Sim control loop. Defaults below target ~5.6 rad/s,
-    # near-critical damping, for this scenario's default masses (~3.14 N gravity load, ~0.32 kg
-    # cable+payload mass) — retune all three if those masses change.
-    gravity_feedforward_n: 3.14   # N — (rod_b_mass+payload_mass)*g
+    # solver through the ROS2 + Isaac Sim control loop. Defaults below target ~4.2 rad/s,
+    # near-critical damping, for this scenario's default masses (~5.54 N gravity load, ~0.565 kg
+    # cable+payload mass, matching cable_torque_ctrl_node's deployed "mass" param) — retune all
+    # three if those masses change.
+    gravity_feedforward_n: 5.54   # N — (rod_b_mass+payload_mass)*g
     kp_speed: 10.0   # N/m
     kd_speed: 4.0    # N.s/m
 
@@ -34,3 +35,24 @@ ak_motor_cable_control_node:
     # External mode torque clamp
     torque_limit_upper:  1.5    # N.m
     torque_limit_lower: -1.5    # N.m
+
+    # EXTERNAL-mode shaft dynamics only (SPEED mode's PD+feedforward hold law is untouched by
+    # this - see file header / compute_and_publish_force() in the .cpp). Some of ext_torque_cmd
+    # goes into accelerating/damping the (fictitious - not present in Isaac Sim's own rigid-body
+    # masses) motor shaft itself; only the remainder reaches the cable as force. Defaults match
+    # cable_torque_ctrl_node's own deployed plant model exactly (AK40-10-ROS2-Bridge/config/
+    # cable_torque_ctrl_params.yaml: ude_inertia, viscous_drag - note the deployed viscous_drag
+    # there is 0.00038, not the .cpp fallback of 0.00140) so the simulated plant matches what
+    # that controller was actually tuned/calibrated against. No static/Coulomb friction term -
+    # viscous only, by design (cable_torque_ctrl_node's own coulomb_friction feedforward becomes
+    # a harmless no-op against a plant that has none).
+    shaft_inertia_kg_m2: 0.000995        # kg.m^2
+    viscous_drag_nms_per_rad: 0.00038    # N.m.s/rad
+
+    # EMA low-pass coefficient (0-1) applied to shaft speed before it's differentiated for the
+    # inertia term above. 1.0 = unfiltered/raw. Computing the derivative against this node's
+    # fixed poll period (instead of the actual measured time between real Isaac Sim samples)
+    # caused sim divergence the moment EXTERNAL RUNNING engaged on first test (2026-07-11) -
+    # fixed by moving the derivative into on_state_cable() using real elapsed time; this filter
+    # is a second, complementary layer against plain sample-to-sample noise.
+    omega_filter_alpha: 0.2

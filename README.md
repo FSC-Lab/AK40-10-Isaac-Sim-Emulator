@@ -80,6 +80,53 @@ payload visibly drop to the ground ~500ms after pressing Stop.
   the PD control law — see the file header comment in
   `src/ak_motor_cable_control_node.cpp` for the full derivation.
 
+## PD+L1 chatter A/B test node (`cable_torque_ctrl_pd_l1_node`)
+
+A diagnostic-only second controller node (not part of the emulator itself), built to test
+whether `cable_torque_ctrl_node`'s residual EXTERNAL-mode chatter comes from its BLSMC
+sliding-mode switching term. Same public interface as `cable_torque_ctrl_node` (drop-in swap),
+same L1 adaptive core, but the switching term is replaced with a plain PD term (`kp_pd`/`kd_pd`).
+
+```bash
+ros2 launch ak_motor_cable_control_emulator cable_torque_ctrl_pd_l1.launch.py
+
+# drive it with the real (unmodified) square-wave reference generator — note cable_square_ref
+# .launch.py hardcodes its remap to /cable_torque_ctrl_node/reference, so run the executable
+# directly instead and remap by hand (quote the remap - unquoted, bash tilde-expands "~" into
+# your home directory before ros2 ever sees it, silently breaking the remap):
+ros2 run ak_motor_driver cable_square_ref_node --ros-args \
+  --params-file install/ak_motor_driver/share/ak_motor_driver/config/cable_square_ref_params.yaml \
+  -r '~/reference:=/cable_torque_ctrl_pd_l1_node/reference'
+```
+
+### Arming
+
+Same authority split as `cable_torque_ctrl_node`: the ground station owns the outer
+`off ↔ standby` gate on the emulator's `ak_motor_cable_control_node`, and this node's own
+`~/arm` service owns the inner `standby ↔ running` gate. `~/ext_torque_enable=true` has no
+effect while the emulator is still `"off"`, so external mode must be opened first.
+
+```bash
+# 1. open external mode on the emulator (or click "Enable External Mode" in the ground station GUI)
+ros2 service call /ak_motor_cable_control_node/enable_external_mode std_srvs/srv/Trigger {}
+ros2 topic echo /ak_motor_cable_control_node/ext_mode_state --once   # expect "standby"
+
+# 2. arm this node — captures the current position as the gravity-hold setpoint, resets L1,
+#    and publishes ext_torque_enable=true (standby -> running)
+ros2 service call /cable_torque_ctrl_pd_l1_node/arm std_srvs/srv/Trigger {}
+ros2 topic echo /ak_motor_cable_control_node/ext_mode_state --once   # expect "running"
+```
+
+Disarm with `ros2 service call /cable_torque_ctrl_pd_l1_node/disarm std_srvs/srv/Trigger {}`.
+
+**Friction feedforward is viscous-only here** (no Coulomb term, unlike `cable_torque_ctrl_node`)
+— this sim's shaft model has no Coulomb/static friction at all, and carrying the real Coulomb
+value over produced a sustained ~23cm limit-cycle oscillation even while just holding position
+(a relay force in phase with velocity, injecting energy every cycle with no real friction to
+cancel). **Confirmed live (2026-07-11)**: removing it made the controller smoother with no
+chattering — this reframes the earlier chatter investigation to some degree; see this package's
+own `CLAUDE.md` for the full writeup.
+
 ## `effective_radius`
 
 The sim applies a direct linear force to the cable (no drum). `effective_radius`

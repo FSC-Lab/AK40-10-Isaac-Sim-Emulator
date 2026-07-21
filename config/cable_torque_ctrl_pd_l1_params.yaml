@@ -1,0 +1,41 @@
+cable_torque_ctrl_pd_l1_node:
+  ros__parameters:
+    # ── Plant ──────────────────────────────────────────────────────────────
+    drum_radius: 0.036    # m  (36 mm); must match cable_control_emulator_params.yaml
+    mass:        0.565    # kg (565 g)
+
+    # ── PD (replaces cable_torque_ctrl_node's BLSMC reaching law/switching term) ────────
+    # tau_ff = r*M_eff_hat*a_dyn + m_hat*g*r + tau_f   (L1-adapted M_eff, m; same as BLSMC's tau_eq
+    #          feedforward, minus BLSMC's -kp_c*e_v term, which is folded into kd_pd below)
+    # tau_pd = r*M_eff_hat*(-kp_pd*e_p - kd_pd*e_v)    (smooth PD feedback, replaces tau_sw)
+    # tau    = sat(tau_ff + tau_pd, sat_lower, sat_upper)
+    kp_pd:   10.0   # N.m/m     position-error gain (scaled by r*M_eff_hat)
+    kd_pd:    4.0   # N.m.s/m   velocity-error gain (scaled by r*M_eff_hat)
+    sat_upper:  1.5  # N.m
+    sat_lower: -1.5  # N.m
+    motor_direction: 1  # 1 or -1: set to -1 if positive torque extends instead of retracts
+
+    # ── Friction feedforward — viscous only, no Coulomb term (unlike cable_torque_ctrl_node).
+    # This sim's shaft-dynamics model has no Coulomb/static friction (see the emulator's own
+    # CLAUDE.md, "Shaft dynamics"); carrying the real Coulomb value over here caused a sustained
+    # ~23cm limit-cycle oscillation while holding position with no reference (relay-like force
+    # in phase with velocity, injecting energy every cycle with no matching real friction to
+    # cancel). Removed entirely rather than zeroed, since there's nothing here for it to ever
+    # compensate.
+    viscous_drag: 0.00038  # N.m·s/rad (matches cable_torque_ctrl_node's deployed value)
+
+    # ── L1 adaptive — identical to cable_torque_ctrl_node (§9, BLSMC_design.md) ────────
+    l1_as:          50.0   # state predictor gain (>> control bandwidth; discrete stable: |1-dt*as|<1)
+    l1_gamma_1:      5.0   # adaptation gain for theta_1 (control effectiveness)
+    l1_gamma_2:      5.0   # adaptation gain for theta_2 (gravity/mass term)
+    l1_omega_f:      5.0   # rad/s  low-pass filter bandwidth (time constant = 0.2 s)
+    l1_theta_1_min:  2.0   # projection lower bound on theta_1 (prevents M_eff > ~14 kg)
+
+    # ── UDE (monitor only — NOT injected into control) — identical to cable_torque_ctrl_node
+    ude_lambda:         10.0      # rad/s  estimator bandwidth
+    ude_inertia:        0.000995  # kg·m²  shaft moment of inertia J (from direct regression)
+    ude_integral_limit: 0.06      # N·m    anti-windup clamp on lambda*integral_term
+
+    # ── Timing ─────────────────────────────────────────────────────────────
+    poll_rate_hz:        100.0
+    reference_timeout_ms: 500.0

@@ -4,5 +4,9 @@ add_executable(ak_motor_cable_control_node ak_motor_cable_control_node.cpp)
 target_compile_features(ak_motor_cable_control_node PRIVATE cxx_std_17)
 ament_target_dependencies(ak_motor_cable_control_node ${_deps})
 
-install(TARGETS ak_motor_cable_control_node
+add_executable(cable_torque_ctrl_pd_l1_node cable_torque_ctrl_pd_l1_node.cpp)
+target_compile_features(cable_torque_ctrl_pd_l1_node PRIVATE cxx_std_17)
+ament_target_dependencies(cable_torque_ctrl_pd_l1_node ${_deps})
+
+install(TARGETS ak_motor_cable_control_node cable_torque_ctrl_pd_l1_node
   RUNTIME DESTINATION lib/${PROJECT_NAME})

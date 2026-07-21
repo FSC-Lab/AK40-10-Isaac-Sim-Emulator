@@ -14,13 +14,20 @@
 // received in those modes are not applied to the cable — the poll loop just holds the cable
 // at its current position instead (see compute_and_publish_force()).
 //
+// EXTERNAL mode simulates shaft inertia + viscous drag (no static/Coulomb friction) between
+// ext_torque_cmd and the force actually delivered to the cable — see the "Shaft dynamics"
+// section in compute_and_publish_force() for the derivation. SPEED mode is NOT given this
+// treatment; it keeps its existing simplified position-hold PD+feedforward law exactly as-is
+// (a deliberate scope decision — SPEED mode exists for convenient bench/setup testing, not for
+// validating cable_torque_ctrl_node, which is what EXTERNAL mode is for).
+//
 // DELIBERATE DIVERGENCE FROM THE REAL DRIVER (temporary): on real hardware, SPEED mode's
 // ~/command.velocity[0] is raw motor-shaft rad/s and the control law is a pure damper
 // (force = kd_speed*(v_des-v_actual), no position term, and no gravity feedforward) — see
 // AK40-10-ROS2-Bridge's ak_motor_cable_control_node.cpp. That's fine on real hardware, where
 // the winch's own mechanical friction/self-locking keeps a stale/disabled command from letting
 // the load free-fall. This sim's cable is frictionless: a pure damper (or its watchdog
-// fallback) would let the ~3.14 N gravity load on the default payload free-fall to the ground
+// fallback) would let the ~5.54 N gravity load on the default payload free-fall to the ground
 // whenever there's no fresh command driving it (confirmed empirically — e.g. the GUI's Stop
 // button publishes one command then stops, so anything relying on continuous commands to hold
 // position drops the payload ~500ms later). So here, ~/command.velocity[0] is instead
@@ -65,20 +72,36 @@ class AkMotorCableControlNode : public rclcpp::Node {
     // disturbance rejection — keeping them soft enough to stay stable through the ROS2 +
     // Isaac Sim (GUI-rendering, sub-100Hz) control loop. An earlier attempt at kp_speed=2000
     // (implying a ~79 rad/s natural frequency) made kp alone fight gravity and was stiff
-    // enough to destabilize the physics solver. Defaults below target ~5.6 rad/s, near-critical
-    // damping, for this scenario's default ~0.32 kg cable+payload mass — retune (along with
+    // enough to destabilize the physics solver. Defaults below target ~4.2 rad/s, near-critical
+    // damping, for this scenario's default ~0.565 kg cable+payload mass (matches
+    // cable_torque_ctrl_node's deployed "mass" param, see CLAUDE.md) — retune (along with
     // gravity_feedforward_n) if scenario masses change.
-    declare_parameter("gravity_feedforward_n", 3.14);  // N — (rod_b_mass+payload_mass)*g
+    declare_parameter("gravity_feedforward_n", 5.54);  // N — (rod_b_mass+payload_mass)*g
     declare_parameter("kp_speed", 10.0);   // N/m
     declare_parameter("kd_speed", 4.0);    // N.s/m
     declare_parameter("command_timeout_ms", 500.0);
     declare_parameter("heartbeat_timeout_ms", 1500.0);
     declare_parameter("torque_limit_upper",  1.5);   // N.m
     declare_parameter("torque_limit_lower", -1.5);   // N.m
+    // EXTERNAL-mode shaft dynamics (see "Shaft dynamics" note in compute_and_publish_force()).
+    // Defaults match cable_torque_ctrl_node's own deployed plant model exactly
+    // (AK40-10-ROS2-Bridge/config/cable_torque_ctrl_params.yaml: ude_inertia, viscous_drag —
+    // note the deployed viscous_drag there is 0.00038, not the .cpp fallback of 0.00140) so the
+    // simulated plant matches what that controller was actually tuned/calibrated against.
+    declare_parameter("shaft_inertia_kg_m2", 0.000995);       // kg.m^2
+    declare_parameter("viscous_drag_nms_per_rad", 0.00038);   // N.m.s/rad
+    // Low-pass filter applied to the measured shaft speed BEFORE it's differentiated for the
+    // inertia term (and before it's used in the viscous term) — see "Noise consideration" in
+    // CLAUDE.md. EMA coefficient, 0-1: 1.0 = no filtering (raw, noisy), smaller = more smoothing
+    // / more lag. 0.2 at the default 100 Hz poll rate gives a time constant of ~40 ms.
+    declare_parameter("omega_filter_alpha", 0.2);
 
     const std::string isaac_prefix = get_parameter("isaac_winch_prefix").as_string();
     const double rate_hz  = get_parameter("poll_rate_hz").as_double();
     effective_radius_     = get_parameter("effective_radius").as_double();
+    shaft_inertia_kg_m2_        = get_parameter("shaft_inertia_kg_m2").as_double();
+    viscous_drag_nms_per_rad_   = get_parameter("viscous_drag_nms_per_rad").as_double();
+    omega_filter_alpha_         = get_parameter("omega_filter_alpha").as_double();
     command_timeout_ms_   = get_parameter("command_timeout_ms").as_double();
     heartbeat_timeout_ms_ = get_parameter("heartbeat_timeout_ms").as_double();
     gravity_feedforward_n_ = get_parameter("gravity_feedforward_n").as_double();
@@ -255,10 +278,11 @@ class AkMotorCableControlNode : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(),
                 "Cable control emulator ready (Isaac Sim prefix '%s', effective_radius=%.4f m, "
-                "gravity_feedforward_n=%.2f N, kp_speed=%.1f N/m, kd_speed=%.1f N.s/m), "
+                "gravity_feedforward_n=%.2f N, kp_speed=%.1f N/m, kd_speed=%.1f N.s/m, "
+                "shaft_inertia=%.6f kg.m^2, viscous_drag=%.5f N.m.s/rad [EXTERNAL mode only]), "
                 "default mode: SPEED",
                 isaac_prefix.c_str(), effective_radius_, gravity_feedforward_n_, kp_speed_,
-                kd_speed_);
+                kd_speed_, shaft_inertia_kg_m2_, viscous_drag_nms_per_rad_);
   }
 
  private:
@@ -333,24 +357,62 @@ class AkMotorCableControlNode : public rclcpp::Node {
   void on_state_cable(const sensor_msgs::msg::JointState::SharedPtr msg) {
     last_extension_     = msg->position.empty() ? last_extension_     : msg->position[0];
     last_extension_vel_ = msg->velocity.empty() ? last_extension_vel_ : msg->velocity[0];
+
+    // Shaft speed/acceleration (EXTERNAL mode only — see "Shaft dynamics" in CLAUDE.md), updated
+    // HERE rather than in the poll_tick()-driven compute_and_publish_force(), because this is
+    // where a genuinely fresh sample actually arrives. Isaac Sim publishes state/cable on its own
+    // physics-step cadence, not necessarily locked to this node's 100 Hz poll timer — computing
+    // the derivative against an assumed-fixed poll period diverged badly the moment EXTERNAL
+    // RUNNING engaged (first real test, 2026-07-11): whenever the real inter-sample time didn't
+    // match the assumed period, the finite difference was silently scaled by however wrong that
+    // assumption was, and any msg backlog/burst amplified it further. Using the actual measured
+    // wall-clock dt between real samples (plus a low-pass filter on omega itself, per the "Noise
+    // consideration" note in CLAUDE.md) fixes both the timing mismatch and plain sensor noise.
+    const double omega_new_retract = -last_extension_vel_ / effective_radius_;
+    const double omega_prev_retract = omega_filtered_retract_;
+    omega_filtered_retract_ = omega_filter_alpha_ * omega_new_retract
+                             + (1.0 - omega_filter_alpha_) * omega_prev_retract;
+    const rclcpp::Time t_now = now();
+    if (has_state_) {
+      const double dt = (t_now - last_state_time_).seconds();
+      if (dt > 1e-4) {  // guard against duplicate/near-simultaneous timestamps
+        omega_dot_retract_ = (omega_filtered_retract_ - omega_prev_retract) / dt;
+      }
+    }
+    last_state_time_ = t_now;
     has_state_ = true;
 
     const double cable_length = last_extension_ - extension_offset_;
+
+    // Filtered velocity for anything PUBLISHED to downstream consumers (cable_torque_ctrl_node,
+    // the GUI) — reuses omega_filtered_retract_ (already computed above) rather than a second,
+    // independent filter, so there's one source of truth for "the filtered cable speed." This
+    // matters a lot more than it might look: cable_torque_ctrl_node's sliding-mode/L1-adaptive
+    // law is specifically DESIGNED to react sharply to velocity/tracking-error, tuned against
+    // real hardware's clean encoder feedback over CAN. Feeding it Isaac Sim's raw (noisier)
+    // rigid-body velocity caused it to chatter — visible as growing oscillation and repeated
+    // torque-limit spikes even with cable_torque_ctrl_node just holding position (no external
+    // reference), first observed 2026-07-11. Position is left unfiltered (real encoders are
+    // typically far cleaner on position than on differentiated velocity, so this mirrors what a
+    // real sensor chain would actually look like, rather than over-filtering everything blindly).
+    const double filtered_extension_vel = -omega_filtered_retract_ * effective_radius_;
 
     // ~/cable_state: length decreases / velocity negative on retract — same sign convention
     // as the sim's extension/extension_vel (both extend-positive), so no flip needed here.
     std_msgs::msg::Float32MultiArray cable_state_msg;
     cable_state_msg.data = {static_cast<float>(cable_length),
-                             static_cast<float>(last_extension_vel_)};
+                             static_cast<float>(filtered_extension_vel)};
     cable_state_pub_->publish(cable_state_msg);
 
     // ~/joint_state: synthesized raw-shaft rad/rad-s, positive = retract (opposite sign from
     // the sim's extend-positive convention — see sign-convention table in the design plan).
+    // velocity here is exactly omega_filtered_retract_ already (no conversion needed - it's
+    // already retract-positive rad/s).
     sensor_msgs::msg::JointState js;
     js.header.stamp = now();
     js.name.push_back("ak40_10_sim");
     js.position.push_back(-cable_length / effective_radius_);
-    js.velocity.push_back(-last_extension_vel_ / effective_radius_);
+    js.velocity.push_back(omega_filtered_retract_);
     js.effort.push_back(last_force_retract_ * effective_radius_);
     joint_state_pub_->publish(js);
   }
@@ -430,9 +492,20 @@ class AkMotorCableControlNode : public rclcpp::Node {
   // position and the SAME PD+feedforward law holds it there. Unlike the real driver's
   // kd_watchdog fallback (a weak pure damper, safe on real hardware because the winch's own
   // mechanical friction/self-locking keeps it from free-falling), this sim's cable is
-  // frictionless: without feedforward, the fallback branch would let the payload's ~3.14 N
+  // frictionless: without feedforward, the fallback branch would let the payload's ~5.54 N
   // weight free-fall to the ground. So there is deliberately no separate weak "watchdog" law
   // here — going stale means "hold position," not "go passive."
+  // Shaft dynamics (EXTERNAL mode only): the motor shaft and the cable share one rigid DOF (the
+  // drum has no slip), so shaft angular velocity is just the measured cable velocity converted
+  // through effective_radius_ — no separate integrated shaft state is needed, and it can't drift
+  // out of sync with what Isaac Sim is actually doing. omega_filtered_retract_/omega_dot_retract_
+  // are computed in on_state_cable() (using the ACTUAL elapsed time between real Isaac Sim
+  // samples, not this function's poll period — see that function's comment for why that
+  // distinction matters) and just read here. The torque the shaft's own inertia and viscous drag
+  // "absorb" (J*omega_dot + b*omega) is subtracted from ext_torque_cmd_ before converting the
+  // remainder to a force — i.e. some of the commanded torque goes into accelerating/dragging the
+  // (fictitious, not present in Isaac Sim's own rigid-body masses) shaft itself, only the rest
+  // reaches the cable.
   void compute_and_publish_force() {
     const double v_actual_retract = -last_extension_vel_;
     const double p_actual = p_actual_retract();
@@ -442,8 +515,16 @@ class AkMotorCableControlNode : public rclcpp::Node {
       force_retract = 0.0;  // freewheel — stands in for the real exit_mit_mode CAN frame
       p_des_retract_ = p_actual;
     } else if (ext_mode_state_ == ExternalModeState::RUNNING) {
-      force_retract = ext_torque_cmd_ / effective_radius_;
+      const double tau_shaft_absorbed = shaft_inertia_kg_m2_ * omega_dot_retract_
+                                       + viscous_drag_nms_per_rad_ * omega_filtered_retract_;
+      const double tau_to_cable = ext_torque_cmd_ - tau_shaft_absorbed;
+      force_retract = tau_to_cable / effective_radius_;
       p_des_retract_ = p_actual;
+      RCLCPP_DEBUG(get_logger(),
+          "shaft: omega=%.4f omega_dot=%.4f tau_absorbed=%.5f ext_torque_cmd=%.5f "
+          "tau_to_cable=%.5f force=%.4f",
+          omega_filtered_retract_, omega_dot_retract_, tau_shaft_absorbed, ext_torque_cmd_,
+          tau_to_cable, force_retract);
     } else {
       const double elapsed_ms = (now() - last_cmd_time_).nanoseconds() / 1e6;
       const bool command_fresh = has_command_ && elapsed_ms <= command_timeout_ms_;
@@ -558,7 +639,7 @@ class AkMotorCableControlNode : public rclcpp::Node {
   bool         heartbeat_lost_{false};
   double       command_timeout_ms_{500.0};
   double       heartbeat_timeout_ms_{1500.0};
-  double       gravity_feedforward_n_{3.14};  // N — cancels constant gravity load in SPEED mode
+  double       gravity_feedforward_n_{5.54};  // N — cancels constant gravity load in SPEED mode
   double       kp_speed_{10.0};              // N/m — SPEED-mode PD position gain
   double       kd_speed_{4.0};               // N.s/m — SPEED-mode PD velocity gain
   double       p_des_retract_{0.0};         // m — SPEED-mode integrated position setpoint
@@ -569,6 +650,17 @@ class AkMotorCableControlNode : public rclcpp::Node {
   double            ext_torque_cmd_{0.0};
   double            torque_limit_upper_{1.5};    // N.m
   double            torque_limit_lower_{-1.5};   // N.m
+
+  // External-mode shaft dynamics (see "Shaft dynamics" note in compute_and_publish_force() and
+  // on_state_cable()). omega_filtered_retract_/omega_dot_retract_ are computed in
+  // on_state_cable() — using the actual measured wall-clock time between real Isaac Sim samples
+  // (last_state_time_), not this node's poll period — and just read in compute_and_publish_force().
+  double shaft_inertia_kg_m2_{0.000995};        // kg.m^2 — matches cable_torque_ctrl_node's ude_inertia
+  double viscous_drag_nms_per_rad_{0.00038};    // N.m.s/rad — matches its deployed viscous_drag
+  double omega_filter_alpha_{0.2};              // EMA coefficient applied to shaft speed before differentiating
+  double omega_filtered_retract_{0.0};          // rad/s — filtered shaft speed
+  double omega_dot_retract_{0.0};               // rad/s^2 — filtered shaft acceleration
+  rclcpp::Time last_state_time_{0, 0, RCL_ROS_TIME};  // timestamp of the last on_state_cable() call
 
   // Isaac Sim state (raw, extend-positive — as received from ROS2CableWinchBackend)
   double effective_radius_{0.036};    // m — torque(N.m)/force(N), rad-s/m-s scale factor
